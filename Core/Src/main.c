@@ -30,14 +30,19 @@
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
 
-
+typedef struct {
+    uint16_t id;
+    uint8_t data[2];
+} uart_msg_t;
 
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 
-#define QLEN 32
+#define UART_DMA_RX_SZ 256 // UART circular DMA RX buffer size
+
+/* UART message packet protocol */
 #define UART_ID_VOLTAGE 0x0001
 #define UART_ID_CURRENT 0x0002
 
@@ -55,8 +60,33 @@ DMA_HandleTypeDef hdma_usart1_rx;
 
 /* USER CODE BEGIN PV */
 
-uint8_t tx_frame[1+2+1+8+1];
+// Variables storing UART RX data
+static float target_voltage = 0.0f;
+
+// UART TX variables
+uint8_t tx_frame[1+2+2+1];
 static volatile uint8_t uart_tx_busy = 0;
+
+// Buffer for storing UART messages by circular DMA
+static uint8_t uart_dma_rx[UART_DMA_RX_SZ];
+static volatile uint16_t uart_dma_last_pos = 0;
+
+// UART Debugging
+typedef struct {
+    volatile uint32_t irq_hits;
+    volatile uint32_t rx_cb_hits;
+    volatile uint32_t rx_events;
+    volatile uint16_t last_size;
+    volatile uint8_t last_bytes[8];
+} uart_dbg_t;
+
+uart_dbg_t g_uart_dbg = {0};
+
+volatile uint32_t g_uart_err_hits = 0;
+volatile uint32_t g_uart_last_err = 0;
+volatile uint32_t g_uart_last_isr = 0;
+
+static volatile uint8_t dbg_captured = 0;
 
 /* USER CODE END PV */
 
@@ -67,12 +97,20 @@ static void MX_DMA_Init(void);
 static void MX_USART1_UART_Init(void);
 /* USER CODE BEGIN PFP */
 
+// === UART Debugging ===
+static uint8_t xor_crc(const uint8_t *p, uint16_t n);
+
+// === UART data TX, encoding and framing ===
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart);
 static void uart_send_voltage(float v);
 static void uart_send_current(float i);
-static uint8_t xor_crc(const uint8_t *p, uint16_t n);
-void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart);
-static void uart_send_msg(uint16_t id, const uint8_t *data, uint8_t len);
-static void button_task(void);
+static void uart_send_msg(uint16_t id, const uint8_t *data);
+
+// === UART data RX, parsing and processing ===
+void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size);
+static int parser_feed_byte(uint8_t b, uart_msg_t *out);
+static void uart_rx_process_dma(void);
+static void log_uart_data(const uart_msg_t *m);
 
 /* USER CODE END PFP */
 
@@ -114,16 +152,35 @@ int main(void)
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
 
-
+  /* UART initialization */
+  HAL_UARTEx_ReceiveToIdle_DMA(&huart1, uart_dma_rx, UART_DMA_RX_SZ);
+  __HAL_DMA_DISABLE_IT(huart1.hdmarx, DMA_IT_HT);
 
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
+
   while (1)
   {
-	  button_task();
-	  HAL_Delay(5);
+	  /* Processes UART messages stored in buffer */
+	 uart_rx_process_dma(); // TODO: parse and process RX without polling
+
+	 /* Sample UART TX for voltage and current readings */
+      if (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_13) == GPIO_PIN_SET) {
+          uart_send_voltage(250.3f);
+          uart_send_current(7.52f);
+          HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, GPIO_PIN_SET); // LED OFF
+      } else {
+          uart_send_voltage(567.8f);
+          uart_send_current(5.71f);
+          HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, GPIO_PIN_RESET); // LED ON
+      }
+
+      HAL_Delay(5); // Wait 5 ms before processing UART again
+
+	  /* Note that UART baud rate is 115200 bits per second, or 86.806 us per byte.
+	   * For the 6 byte frame, transmission takes at least 520.836 us. */
   }
 
     /* USER CODE END WHILE */
@@ -286,18 +343,19 @@ static void MX_GPIO_Init(void)
 
 /* USER CODE BEGIN 4 */
 
-static void uart_send_voltage(float v)
-{
-    uint8_t payload[4];
-    memcpy(payload, &v, sizeof(v));
-    uart_send_msg(UART_ID_VOLTAGE, payload, 4);
-}
+// === UART Debugging ===
 
-static void uart_send_current(float i)
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
 {
-    uint8_t payload[4];
-    memcpy(payload, &i, sizeof(i));
-    uart_send_msg(UART_ID_CURRENT, payload, 4);
+    if (huart->Instance != USART1) return;
+
+    g_uart_err_hits++;
+    g_uart_last_err = huart->ErrorCode;
+    g_uart_last_isr = huart->Instance->ISR;
+
+    HAL_UART_AbortReceive(huart);
+    uart_dma_last_pos = 0;
+    HAL_UARTEx_ReceiveToIdle_DMA(&huart1, uart_dma_rx, UART_DMA_RX_SZ);
 }
 
 static uint8_t xor_crc(const uint8_t *p, uint16_t n)
@@ -307,70 +365,186 @@ static uint8_t xor_crc(const uint8_t *p, uint16_t n)
 	return c;
 }
 
+// === UART data TX, encoding and framing ===
+
 void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
 {
     if(huart->Instance == USART1) uart_tx_busy = 0;
 }
 
-static void uart_send_msg(uint16_t id, const uint8_t *data, uint8_t len)
+static void uart_send_voltage(float v)
 {
-    if(len > 8) len = 8;          // your new protocol allows up to 8 bytes
-    if(uart_tx_busy) return;      // or queue it later
+	int val = (int)(v * 10.0f + 0.5f);   // convert to xxx.x format
+	uint8_t data[2];
+
+	uint8_t d0 = (val / 1000) % 10;
+	uint8_t d1 = (val / 100)  % 10;
+	uint8_t d2 = (val / 10)   % 10;
+	uint8_t d3 =  val % 10;
+
+	data[0] = (d0 << 4) | d1;
+	data[1] = (d2 << 4) | d3;
+
+    uart_send_msg(UART_ID_VOLTAGE, data);
+}
+
+static void uart_send_current(float i)
+{
+	int val = (int)(i * 100.0f + 0.5f);   // convert to xx.xx format
+	uint8_t data[2];
+
+	uint8_t d0 = (val / 1000) % 10;
+	uint8_t d1 = (val / 100)  % 10;
+	uint8_t d2 = (val / 10)   % 10;
+	uint8_t d3 =  val % 10;
+
+	data[0] = (d0 << 4) | d1;
+	data[1] = (d2 << 4) | d3;
+
+    uart_send_msg(UART_ID_CURRENT, data);
+}
+
+static void uart_send_msg(uint16_t id, const uint8_t *data)
+{
+    while (uart_tx_busy) {}      // wait until previous TX is complete
     uart_tx_busy = 1;
 
     uint16_t idx = 0;
     tx_frame[idx++] = 0xA5;                 // SOF
     tx_frame[idx++] = (uint8_t)(id & 0xFF); // ID low byte
     tx_frame[idx++] = (uint8_t)(id >> 8);   // ID high byte
-    tx_frame[idx++] = len;                  // payload length
 
-    for(uint8_t i = 0; i < len; i++) {
-        tx_frame[idx++] = data[i];
-    }
+    tx_frame[idx++] = data[0];
+    tx_frame[idx++] = data[1];
 
-    tx_frame[idx++] = xor_crc(tx_frame, idx);
+    uint8_t crc = xor_crc(tx_frame, idx);
+    tx_frame[idx++] = crc;
 
     if(HAL_UART_Transmit_DMA(&huart1, tx_frame, idx) != HAL_OK) {
         uart_tx_busy = 0;
     }
 
-    HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);
 }
 
-static void button_task(void) // Uses Nucleo board button to test different data sent
+// === UART data RX, parsing and processing ===
+
+void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
 {
-    static uint8_t last_state = 1;
-    static uint32_t last_change = 0;
-    static uint8_t mode = 0;
+    if (huart->Instance != USART1) return;
 
-    uint8_t state = (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_13) == GPIO_PIN_SET) ? 1 : 0;
-    uint32_t now = HAL_GetTick();
+    g_uart_dbg.rx_cb_hits++;
+    g_uart_dbg.last_size = Size;
 
-    if(state != last_state) {
-        last_change = now;
-        last_state = state;
+}
+
+static int parser_feed_byte(uint8_t b, uart_msg_t *out)
+{
+    enum { S_SOF, S_ID0, S_ID1, S_DATA0, S_DATA1, S_CRC };
+    static uint8_t st = S_SOF;
+    static uint8_t buf[1+2+2];
+    static uint8_t idx = 0;
+
+    switch (st)
+    {
+    case S_SOF:
+        if (b == 0xA5) {
+            idx = 0;
+            buf[idx++] = b;
+            st = S_ID0;
+        }
+        break;
+
+    case S_ID0:
+        buf[idx++] = b;
+        st = S_ID1;
+        break;
+
+    case S_ID1:
+        buf[idx++] = b;
+        st = S_DATA0;
+        break;
+
+    case S_DATA0:
+        buf[idx++] = b;
+        st = S_DATA1;
+        break;
+
+    case S_DATA1:
+        buf[idx++] = b;
+        st = S_CRC;
+        break;
+
+    case S_CRC:
+    {
+        uint8_t crc = xor_crc(buf, idx);
+        if (crc == b)
+        {
+            out->id = (uint16_t)buf[1] | ((uint16_t)buf[2] << 8);
+            out->data[0] = buf[3];
+            out->data[1] = buf[4];
+            st = S_SOF;
+            return 1;
+        }
+        st = S_SOF;
+        break;
+    }
     }
 
-    // active low button: pressed = 0
-    if((now - last_change) > 30) {
-        static uint8_t prev_stable = 1;
+    return 0;
+}
 
-        if(state != prev_stable) {
-            prev_stable = state;
+static void uart_rx_process_dma(void)
+{
+    uart_msg_t m;
+    uint16_t pos = UART_DMA_RX_SZ - __HAL_DMA_GET_COUNTER(huart1.hdmarx);
 
-            if(state == 0) {   // button pressed
-                mode ^= 1;
-
-                if(mode == 0) {
-                	uart_send_voltage(300.6f);
-                	uart_send_current(5.52f);
-                } else {
-                	uart_send_voltage(0.0f);
-                	uart_send_current(0.0f);
+    if (pos != uart_dma_last_pos)
+    {
+        if (pos > uart_dma_last_pos)
+        {
+            for (uint16_t i = uart_dma_last_pos; i < pos; i++)
+            {
+                if (parser_feed_byte(uart_dma_rx[i], &m)) {
+                    log_uart_data(&m);
                 }
             }
         }
+        else
+        {
+            for (uint16_t i = uart_dma_last_pos; i < UART_DMA_RX_SZ; i++)
+            {
+                if (parser_feed_byte(uart_dma_rx[i], &m)) {
+                    log_uart_data(&m);
+                }
+            }
+            for (uint16_t i = 0; i < pos; i++)
+            {
+                if (parser_feed_byte(uart_dma_rx[i], &m)) {
+                    log_uart_data(&m);
+                }
+            }
+        }
+
+        uart_dma_last_pos = pos;
     }
+}
+
+static void log_uart_data(const uart_msg_t *m)
+{
+    uint8_t d0 = (m->data[0] >> 4) & 0x0F;
+    uint8_t d1 =  m->data[0]       & 0x0F;
+    uint8_t d2 = (m->data[1] >> 4) & 0x0F;
+    uint8_t d3 =  m->data[1]       & 0x0F;
+
+    // Check that each nibble must be a decimal digit 0..9
+    if(d0 > 9 || d1 > 9 || d2 > 9 || d3 > 9) return;
+
+    if(m->id == 0x01)
+    {
+        // Voltage format: xxx.x
+        target_voltage = (float)(d0 * 100 + d1 * 10 + d2) + ((float)d3 / 10.0f);
+    }
+
 }
 
 /* USER CODE END 4 */
