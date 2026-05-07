@@ -88,6 +88,10 @@ volatile uint32_t g_uart_last_isr = 0;
 
 static volatile uint8_t dbg_captured = 0;
 
+static volatile uint16_t uart_dma_delta = 0;
+
+static volatile uint16_t uart_idle_hits = 0;
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -153,8 +157,7 @@ int main(void)
   /* USER CODE BEGIN 2 */
 
   /* UART initialization */
-  HAL_UARTEx_ReceiveToIdle_DMA(&huart1, uart_dma_rx, UART_DMA_RX_SZ);
-  __HAL_DMA_DISABLE_IT(huart1.hdmarx, DMA_IT_HT);
+  HAL_UARTEx_ReceiveToIdle_DMA(&huart1, uart_dma_rx, UART_DMA_RX_SZ); // RX event interrupt called when buffer is full, half full or line is IDLE for 1 byte
 
   /* USER CODE END 2 */
 
@@ -163,8 +166,6 @@ int main(void)
 
   while (1)
   {
-	  /* Processes UART messages stored in buffer */
-	 uart_rx_process_dma(); // TODO: parse and process RX without polling
 
 	 /* Sample UART TX for voltage and current readings */
       if (HAL_GPIO_ReadPin(GPIOC, GPIO_PIN_13) == GPIO_PIN_SET) {
@@ -177,7 +178,7 @@ int main(void)
           HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, GPIO_PIN_RESET); // LED ON
       }
 
-      HAL_Delay(5); // Wait 5 ms before processing UART again
+      HAL_Delay(1000); // Large delay to test
 
 	  /* Note that UART baud rate is 115200 bits per second, or 86.806 us per byte.
 	   * For the 6 byte frame, transmission takes at least 520.836 us. */
@@ -430,11 +431,11 @@ static void uart_send_msg(uint16_t id, const uint8_t *data)
 
 void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
 {
-    if (huart->Instance != USART1) return;
-
-    g_uart_dbg.rx_cb_hits++;
-    g_uart_dbg.last_size = Size;
-
+	if (huart->Instance == USART1)
+	{
+		uart_rx_process_dma(); // Process received message
+		uart_idle_hits++; // Count parser calls
+	}
 }
 
 static int parser_feed_byte(uint8_t b, uart_msg_t *out)
